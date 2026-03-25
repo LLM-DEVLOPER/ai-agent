@@ -54,7 +54,76 @@ Prefix Cache（也叫 prompt cache）是 KV Cache 的进一步延伸：如果多
 
 **回答要点：**
 
-几个方向：一是 KV Cache 量化，把 K/V 从 fp16 压缩到 int8 甚至 int4，显存减半但精度有损；二是 KV Cache offload，把不活跃的 KV 换出到 CPU 内存或 NVMe，代价是 PCIe 带宽成为新瓶颈；三是 sliding window attention（如 Mistral），只保留最近 N 个 token 的 KV，牺牲超长距离依赖；四是 MQA（Multi-Query Attention）或 GQA（Grouped-Query Attention），减少 KV head 数量，从模型结构层面降低 KV Cache 体积，Llama 3 就用了 GQA。
+几个方向：一是 KV Cache 量化，把 K/V 从 fp16 压缩到 int8 甚至 int4，显存减半但精度有损；二是 KV Cache offload，把不活跃的 KV 换出到 CPU 内存或 NVMe，代价是 PCIe 带宽成为新瓶颈；三是 sliding window attention（如 Mistral），只保留最近 N 个 token 的 KV，牺牲超长距离依赖；四是 MQA/GQA/MLA，减少 KV head 数量，从模型结构层面降低 KV Cache 体积。
+
+---
+
+## 3.5 MHA → MQA → GQA → MLA：Attention 的 KV Cache 压缩演化
+
+**面试官可能会问：** MHA、MQA、GQA、MLA 分别是什么？为什么要从 MHA 演化到后面这些变体？
+
+**回答要点：**
+
+这条演化线的核心驱动力是：**KV Cache 是大模型推理的显存杀手**，减少 KV head 数量是从模型结构层面釜底抽薪。
+
+### MHA（Multi-Head Attention）—— 标准基线
+
+原始 Transformer 的标准设计，$h$ 个注意力头，每个头都有独立的 $Q, K, V$ 投影矩阵：
+
+$$\text{head}_i = \text{Attention}(QW_i^Q, KW_i^K, VW_i^V)$$
+
+KV Cache 大小 = `2 × num_layers × num_heads × head_dim × seq_len × batch_size`
+
+对于 GPT-3（96 层，96 头，head_dim=128），batch=32，seq=2048，KV Cache 约 **192 GB**——远超单卡显存。
+
+### MQA（Multi-Query Attention）—— 激进压缩
+
+Shazeer（2019）提出：**Q 保留多头，但 K 和 V 只保留 1 个头**，所有 Q head 共享同一组 K、V：
+
+$$\text{head}_i = \text{Attention}(QW_i^Q, KW^K, VW^V)$$
+
+KV Cache 压缩比 = `num_heads`（如 32 头就缩小 32 倍）。
+
+**代价**：表达能力下降，不同 Q head 无法关注不同的 K/V 子空间。实验发现质量损失明显，尤其在复杂推理任务上。PaLM、Falcon 系列使用了 MQA。
+
+### GQA（Grouped-Query Attention）—— 质量与效率的平衡
+
+Ainslie et al.（2023）提出折中方案：把 $h$ 个 Q head 分成 $g$ 组，每组共享一组 K、V：
+
+$$g \text{ 组 KV heads}，每组对应 \frac{h}{g} \text{ 个 Q heads}$$
+
+- $g = h$：退化为 MHA（无压缩）
+- $g = 1$：退化为 MQA（最激进压缩）
+- $g = h/8$（如 8 个 KV head 对应 64 个 Q head）：**Llama 3 的配置**
+
+KV Cache 压缩比 = `h/g`，质量介于 MHA 和 MQA 之间，实践中接近 MHA 质量，KV Cache 缩小 4~8 倍。
+
+**Llama 3 70B**：`num_heads=64`，`num_kv_heads=8`，GQA 压缩比 8 倍。Mistral、Gemma、Qwen 系列均使用 GQA。
+
+### MLA（Multi-head Latent Attention）—— DeepSeek 的创新
+
+DeepSeek-V2/V3 提出的新方案，思路完全不同：**不是减少 KV head 数量，而是对 K、V 做低秩压缩（Low-Rank KV Compression）**。
+
+核心思路：把 K、V 先投影到一个低维的潜变量（latent）$c^{KV}$，推理时只缓存这个低维表示，需要时再还原：
+
+$$c_t^{KV} = W^{DKV} h_t \quad (d^c \ll d_h \cdot n_h)$$
+
+$$K_t = W^{UK} c_t^{KV}, \quad V_t = W^{UV} c_t^{KV}$$
+
+KV Cache 只存低维 $c^{KV}$，而不是完整的 K 和 V，压缩比约为 **5.7 倍**（比 GQA 更激进），且**表达能力损失极小**（因为是可学习的低秩投影，而非简单 head 共享）。
+
+DeepSeek-V2 使用 MLA，在 KV Cache 大幅减小的同时，性能接近甚至超过 MHA。
+
+**对比总结**：
+
+| 方案 | KV Cache 大小 | 表达能力 | 代表模型 |
+|------|-------------|---------|---------|
+| **MHA** | 基准（最大） | 最强 | GPT-3、早期 LLaMA |
+| **MQA** | ÷ num_heads | 明显下降 | PaLM、Falcon |
+| **GQA** | ÷ (num_heads/num_kv_heads) | 接近 MHA | Llama 3、Mistral、Qwen |
+| **MLA** | ÷ ~5.7（低秩压缩） | 接近 MHA | DeepSeek-V2/V3 |
+
+> **面试一句话总结**：MQA 激进但损质量，GQA 折中成工业主流，MLA 用低秩投影另辟蹊径，在压缩比和质量上同时做到更好，是 DeepSeek 系列的核心架构创新之一。
 
 ---
 
