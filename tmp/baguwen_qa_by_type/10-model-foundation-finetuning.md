@@ -147,6 +147,23 @@ $$W' = W + \Delta W = W + \frac{\alpha}{r} \cdot BA$$
 3. **再看秩是否够用**——任务复杂度超过 r 的表达能力
 4. **最后考虑扩大覆盖范围**——加更多层的 LoRA
 
+**深入追问：** 训练/微调时 OOM 了怎么办？
+
+**回答要点：**
+
+训练 OOM 和推理 OOM 的根因不同。训练显存消耗 = 模型权重 + 梯度 + 优化器状态（Adam 需要 2 份额外状态）+ 激活值（前向传播中间结果，反向传播时需要）。
+
+**排查与解法：**
+
+1. **减小 batch size**：最直接有效，从 8 降到 4 或 2，用 gradient accumulation 补偿（多步累积梯度再更新）
+2. **用 LoRA/QLoRA 替代全量微调**：QLoRA 把基础模型量化到 4-bit，只训练 LoRA 参数，单卡 24GB 可训 70B
+3. **Gradient Checkpointing**：不保存所有激活值，反向传播时重算，显存换时间（训练慢 20-30%）
+4. **优化器状态 offload**：把 Adam 状态放 CPU（DeepSpeed ZeRO、QLoRA 的 Paged Optimizers）
+5. **混合精度训练**：用 bf16/fp16 替代 fp32，显存减半
+6. **减小序列长度**：`max_seq_length` 从 2048 降到 1024，激活值显存消耗是序列长度的平方
+
+**面试一句话总结**：训练 OOM 先降 batch size + gradient accumulation，再考虑 LoRA/QLoRA，最后上 gradient checkpointing 和 DeepSpeed ZeRO。
+
 ---
 
 ## 4. 灾难性遗忘与通用能力保留
@@ -324,6 +341,30 @@ CoT 数据不只教模型"给出答案"，而是教模型"怎么推理"。包含
 - **数据合规**：私有部署 vs 云 API 调用，数据是否能出境
 
 **决策流程**：先确定任务类型和复杂度（决定基础能力要求）→ 确定部署形式和成本预算（决定参数量上限）→ 在候选模型上跑领域 benchmark（实测优先于榜单排名）→ 确认 License 和合规要求。
+
+**深入追问：** MoE（Mixture of Experts）到底在解决什么问题？为什么参数变大了，算力反而可能更省？
+
+**回答要点：**
+
+MoE 的核心是**参数稀疏激活**：总参数量可以很大，但每个 token 只激活少量专家（Top-K）。例如有 $E$ 个专家，每个 token 只走 $k$ 个专家，活跃参数比例是：
+
+$$\text{Active Ratio} = \frac{k}{E}$$
+
+这意味着：模型总容量（参数量）随 $E$ 增长，但单 token 计算主要随 $k$ 增长。直觉上就是"参数很多，但每次只用一小部分"。
+
+MoE 的关键组件是 Router（门控网络），它根据 token 表示输出专家分数并选择 Top-K 专家。工程上最大的挑战不是"能不能跑起来"，而是**负载均衡**：如果 Router 总把 token 路由到少数几个专家，会出现热点专家过载、其他专家闲置，训练不稳定。Switch Transformer 常用辅助负载均衡损失来约束路由分布：
+
+$$L_{aux} = E \sum_{i=1}^{E} f_i \cdot p_i$$
+
+其中 $f_i$ 是第 $i$ 个专家实际接收 token 的比例，$p_i$ 是 Router 给该专家的平均概率。
+
+另一个关键超参是 Capacity Factor（容量系数），单专家可接收 token 上限通常设为：
+
+$$\text{capacity} = \left\lceil \frac{T}{E} \cdot CF \right\rceil$$
+
+其中 $T$ 是 batch 内 token 数，$CF$ 一般大于 1。CF 太小会丢 token，CF 太大又会降低稀疏计算收益。
+
+**面试一句话总结**：MoE 不是"白嫖参数"，而是用路由和稀疏激活把"容量"和"计算"解耦；收益来自 Top-K 稀疏计算，难点在路由均衡和分布式通信。
 
 ---
 
