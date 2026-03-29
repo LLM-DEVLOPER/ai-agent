@@ -42,6 +42,54 @@
 
 ---
 
+## 2.5 视觉模型基础：ViT 与 CLIP
+
+**面试官可能会问：** ViT（Vision Transformer）是什么？和 CNN 有什么区别？
+
+**回答要点：**
+
+**ViT（Vision Transformer）** 是 Google 在 2020 年提出的视觉 Transformer，核心思想是把图像当作序列处理，而不是用卷积。
+
+**ViT 的工作流程：**
+1. **图像分块（Patch Embedding）**：把图像切成固定大小的 patch（如 16×16），每个 patch 展平成向量
+2. **位置编码**：给每个 patch 加上位置信息（因为 Transformer 本身没有位置感知）
+3. **Transformer 编码**：用标准 Transformer Encoder 处理 patch 序列
+4. **分类头**：取 [CLS] token 的输出做分类
+
+**ViT vs CNN：**
+
+| 维度 | ViT | CNN |
+|------|-----|-----|
+| 归纳偏置 | 弱（需要大数据） | 强（平移不变性、局部性） |
+| 数据需求 | 大（需要 JFT-300M 级别） | 中（ImageNet 即可） |
+| 全局感受野 | 天然全局（self-attention） | 需要堆叠多层 |
+| 计算复杂度 | O(n²)（序列长度平方） | O(n)（卷积核大小固定） |
+
+**深入追问：** CLIP 是什么？它怎么做图文对齐的？
+
+**回答要点：**
+
+**CLIP（Contrastive Language-Image Pre-training）** 是 OpenAI 提出的图文对齐模型，核心是**对比学习**。
+
+**CLIP 的训练机制：**
+1. **双编码器架构**：图像编码器（ViT 或 ResNet）+ 文本编码器（Transformer）
+2. **对比学习目标**：给定一个 batch 的（图像, 文本）对，让匹配的图文对在向量空间里距离近，不匹配的距离远
+
+损失函数（InfoNCE）：
+
+$$\mathcal{L} = -\log \frac{\exp(\text{sim}(I_i, T_i) / \tau)}{\sum_{j=1}^{N} \exp(\text{sim}(I_i, T_j) / \tau)}$$
+
+其中 $\text{sim}$ 是余弦相似度，$\tau$ 是温度参数。
+
+**CLIP 的核心价值：**
+- **零样本分类**：不需要训练，直接用文本描述做分类（"a photo of a cat"）
+- **跨模态检索**：用文本搜图、用图搜文
+- **迁移能力强**：在 4 亿图文对上训练，泛化能力极强
+
+**面试一句话总结：** ViT 用 Transformer 处理图像 patch 序列，CLIP 用对比学习对齐图文向量空间，是多模态模型的视觉基础。
+
+---
+
 ## 3. 多模态 RAG 与图文联合检索
 
 **面试官可能会问：** 什么是多模态 RAG？伪多模态和原生多模态的区别是什么？CLIP 适合什么场景？
